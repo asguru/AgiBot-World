@@ -26,8 +26,8 @@ from PIL import Image
 from tqdm import tqdm
 from pprint import pformat
 from tqdm.contrib.concurrent import process_map
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.datasets.utils import (
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.utils import (
     STATS_PATH,
     check_timestamps_sync,
     get_episode_data_index,
@@ -36,8 +36,8 @@ from lerobot.common.datasets.utils import (
 )
 
 HEAD_COLOR = "head_color.mp4"
-HAND_LEFT_COLOR = "hand_left_color.mp4"
-HAND_RIGHT_COLOR = "hand_right_color.mp4"
+HAND_LEFT_COLOR = "hand_left_fisheye_color.mp4"
+HAND_RIGHT_COLOR = "hand_right_fisheye_color.mp4"
 HEAD_CENTER_FISHEYE_COLOR = "head_center_fisheye_color.mp4"
 HEAD_LEFT_FISHEYE_COLOR = "head_left_fisheye_color.mp4"
 HEAD_RIGHT_FISHEYE_COLOR = "head_right_fisheye_color.mp4"
@@ -153,11 +153,11 @@ FEATURES = {
     },
     "observation.state": {
         "dtype": "float32",
-        "shape": [20],
+        "shape": [30],
     },
     "action": {
         "dtype": "float32",
-        "shape": [22],
+        "shape": [32],
     },
     "episode_index": {
         "dtype": "int64",
@@ -357,61 +357,89 @@ class AgiBotDataset(LeRobotDataset):
             video_backend=video_backend,
         )
 
-    def save_episode(
-        self, task: str, episode_data: dict | None = None, videos: dict | None = None
-    ) -> None:
+    def save_episode(self, episode_data: dict | None = None, videos: dict | None = None) -> None:
         """
-        We rewrite this method to copy mp4 videos to the target position
+        Save episode to disk. Custom implementation to handle video files.
+        
+        Args:
+            episode_data: Optional episode data dict. If None, uses self.episode_buffer
+            videos: Dict mapping video keys to video file paths to copy
         """
         if not episode_data:
             episode_buffer = self.episode_buffer
 
+        # size and task are special cases that won't be added to hf_dataset
         episode_length = episode_buffer.pop("size")
+        tasks = episode_buffer.pop("task")
+        episode_tasks = list(set(tasks))
         episode_index = episode_buffer["episode_index"]
-        if episode_index != self.meta.total_episodes:
-            # TODO(aliberts): Add option to use existing episode_index
-            raise NotImplementedError(
-                "You might have manually provided the episode_buffer with an episode_index that doesn't "
-                "match the total number of episodes in the dataset. This is not supported for now."
-            )
 
         if episode_length == 0:
             raise ValueError(
-                "You must add one or several frames with `add_frame` before calling `add_episode`."
+                "You must add one or several frames with `add_frame` before calling `save_episode`."
             )
 
-        task_index = self.meta.get_task_index(task)
+        episode_buffer["index"] = np.arange(self.meta.total_frames, self.meta.total_frames + episode_length)
+        episode_buffer["episode_index"] = np.full((episode_length,), episode_index)
 
-        if not set(episode_buffer.keys()) == set(self.features):
-            raise ValueError()
+        # Add new tasks to the tasks dictionary
+        for task in episode_tasks:
+            task_index = self.meta.get_task_index(task)
+            if task_index is None:
+                self.meta.add_task(task)
+
+        # Given tasks in natural language, find their corresponding task indices
+        episode_buffer["task_index"] = np.array([self.meta.get_task_index(task) for task in tasks])
 
         for key, ft in self.features.items():
-            if key == "index":
-                episode_buffer[key] = np.arange(
-                    self.meta.total_frames, self.meta.total_frames + episode_length
-                )
-            elif key == "episode_index":
-                episode_buffer[key] = np.full((episode_length,), episode_index)
-            elif key == "task_index":
-                episode_buffer[key] = np.full((episode_length,), task_index)
-            elif ft["dtype"] in ["image", "video"]:
+            # index, episode_index, task_index are already processed above, and image and video
+            # keys are processed separately
+            if key in ["index", "episode_index", "task_index"] or ft["dtype"] in ["image", "video"]:
                 continue
-            elif len(ft["shape"]) == 1 and ft["shape"][0] == 1:
-                episode_buffer[key] = np.array(episode_buffer[key], dtype=ft["dtype"])
-            elif len(ft["shape"]) == 1 and ft["shape"][0] > 1:
-                episode_buffer[key] = np.stack(episode_buffer[key])
-            else:
-                raise ValueError(key)
+            episode_buffer[key] = np.stack(episode_buffer[key])
 
         self._wait_image_writer()
         self._save_episode_table(episode_buffer, episode_index)
+        
+        # Copy video files if provided
+        if videos:
+            for key in self.meta.video_keys:
+                if key in videos:
+                    video_path = self.root / self.meta.get_video_file_path(episode_index, key)
+                    video_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(videos[key], video_path)
 
-        self.meta.save_episode(episode_index, episode_length, task, task_index)
-        for key in self.meta.video_keys:
-            video_path = self.root / self.meta.get_video_file_path(episode_index, key)
-            episode_buffer[key] = video_path
-            video_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(videos[key], video_path)
+        # Compute episode statistics (custom implementation for numpy arrays)
+        from lerobot.datasets.compute_stats import get_feature_stats
+        
+        ep_stats = {}
+        for key, data in episode_buffer.items():
+            if self.features[key]["dtype"] == "string":
+                continue  # Skip string features
+            elif self.features[key]["dtype"] in ["image", "video"]:
+                # Handle image/video features that are numpy arrays
+                if isinstance(data, list) and len(data) > 0:
+                    # Stack the image arrays and compute stats
+                    ep_ft_array = np.stack(data)  # Shape: [num_frames, height, width, channels]
+                    if ep_ft_array.ndim == 4:  # [frames, h, w, c]
+                        # Convert to channel-first format expected by LeRobot: [frames, c, h, w]
+                        ep_ft_array = np.transpose(ep_ft_array, (0, 3, 1, 2))
+                        axes_to_reduce = (0, 2, 3)  # keep channel dim
+                        keepdims = True
+                        ep_stats[key] = get_feature_stats(ep_ft_array, axis=axes_to_reduce, keepdims=keepdims)
+                        # Normalize by 255 and remove batch dim like LeRobot does
+                        ep_stats[key] = {
+                            k: v if k == "count" else np.squeeze(v / 255.0, axis=0) 
+                            for k, v in ep_stats[key].items()
+                        }
+            else:
+                # Handle numeric features
+                if isinstance(data, np.ndarray) and data.size > 0:
+                    axes_to_reduce = 0  # compute stats over the first axis
+                    keepdims = data.ndim == 1  # keep as np.array
+                    ep_stats[key] = get_feature_stats(data, axis=axes_to_reduce, keepdims=keepdims)
+        self.meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats)
+        
         if not episode_data:  # Reset the buffer
             self.episode_buffer = self.create_episode_buffer()
         self.consolidated = False
@@ -423,11 +451,12 @@ class AgiBotDataset(LeRobotDataset):
         self.episode_data_index = get_episode_data_index(
             self.meta.episodes, self.episodes
         )
-        check_timestamps_sync(
-            self.hf_dataset, self.episode_data_index, self.fps, self.tolerance_s
-        )
+        timestamps = torch.stack(self.hf_dataset["timestamp"]).numpy()
+        episode_indices = torch.stack(self.hf_dataset["episode_index"]).numpy()
+        ep_data_index_np = {k: t.numpy() for k, t in self.episode_data_index.items()}
+        check_timestamps_sync(timestamps, episode_indices, ep_data_index_np, self.fps, self.tolerance_s)
         if len(self.meta.video_keys) > 0:
-            self.meta.write_video_info()
+            self.meta.update_video_info()
 
         if not keep_image_files:
             img_dir = self.root / "images"
@@ -441,58 +470,73 @@ class AgiBotDataset(LeRobotDataset):
 
         if run_compute_stats:
             self.stop_image_writer()
-            self.meta.stats = compute_stats(self)
-            serialized_stats = serialize_dict(self.meta.stats)
-            write_json(serialized_stats, self.root / STATS_PATH)
+            # Aggregate episode stats that were computed during save_episode()
+            from lerobot.datasets.compute_stats import aggregate_stats
+            if hasattr(self.meta, 'episodes_stats') and self.meta.episodes_stats:
+                episodes_stats_list = list(self.meta.episodes_stats.values())
+                self.meta.stats = aggregate_stats(episodes_stats_list)
+                serialized_stats = serialize_dict(self.meta.stats)
+                write_json(serialized_stats, self.root / STATS_PATH)
+            else:
+                logging.warning("No episode statistics found to aggregate.")
             self.consolidated = True
         else:
             logging.warning(
                 "Skipping computation of the dataset statistics, dataset is not fully consolidated."
             )
 
-    def add_frame(self, frame: dict) -> None:
+    def add_frame(self, frame: dict, task: str, timestamp: float | None = None) -> None:
         """
         This function only adds the frame to the episode_buffer. Apart from images — which are written in a
         temporary directory — nothing is written to disk. To save those frames, the 'save_episode()' method
         then needs to be called.
         """
-        # TODO(aliberts, rcadene): Add sanity check for the input, check it's numpy or torch,
-        # check the dtype and shape matches, etc.
+        # Convert torch to numpy if needed
+        for name in frame:
+            if isinstance(frame[name], torch.Tensor):
+                frame[name] = frame[name].numpy()
+
+        # Use task from frame if present, otherwise use the passed parameter
+        frame_task = frame.pop("task", None)
+        if frame_task is not None:
+            task = frame_task
 
         if self.episode_buffer is None:
             self.episode_buffer = self.create_episode_buffer()
 
+        # Automatically add frame_index and timestamp to episode buffer
         frame_index = self.episode_buffer["size"]
-        timestamp = (
-            frame.pop("timestamp") if "timestamp" in frame else frame_index / self.fps
-        )
+        if timestamp is None:
+            timestamp = frame_index / self.fps
         self.episode_buffer["frame_index"].append(frame_index)
         self.episode_buffer["timestamp"].append(timestamp)
+        self.episode_buffer["task"].append(task)
 
+        # Add frame features to episode_buffer
         for key in frame:
             if key not in self.features:
-                raise ValueError(key)
-            item = (
-                frame[key].numpy()
-                if isinstance(frame[key], torch.Tensor)
-                else frame[key]
-            )
-            self.episode_buffer[key].append(item)
+                raise ValueError(
+                    f"An element of the frame is not in the features. '{key}' not in '{self.features.keys()}'."
+                )
+            self.episode_buffer[key].append(frame[key])
 
         self.episode_buffer["size"] += 1
 
 
-def load_depths(root_dir: str, camera_name: str):
+def load_depths(root_dir: str, camera_name: str, max_frames: int = None):
     cam_path = Path(root_dir)
     all_imgs = sorted(list(cam_path.glob(f"{camera_name}*")))
+    if max_frames:
+        all_imgs = all_imgs[:max_frames]
     return [np.array(Image.open(f)).astype(np.float32) / 1000 for f in all_imgs]
 
 
-def load_local_dataset(episode_id: int, src_path: str, task_id: int) -> list | None:
+def load_local_dataset(episode_id: int, src_path: str, task_id: int, debug: bool = False) -> list | None:
     """Load local dataset and return a dict with observations and actions"""
 
     ob_dir = Path(src_path) / f"observations/{task_id}/{episode_id}"
-    depth_imgs = load_depths(ob_dir / "depth", HEAD_DEPTH)
+    max_frames = 500 if debug else None
+    depth_imgs = load_depths(ob_dir / "depth", HEAD_DEPTH, max_frames)
     proprio_dir = Path(src_path) / f"proprio_stats/{task_id}/{episode_id}"
 
     with h5py.File(proprio_dir / "proprio_stats.h5") as f:
@@ -505,6 +549,19 @@ def load_local_dataset(episode_id: int, src_path: str, task_id: int) -> list | N
         action_head = np.array(f["action/head/position"])
         action_waist = np.array(f["action/waist/position"])
         action_velocity = np.array(f["action/robot/velocity"])
+
+    # In debug mode, only process the same number of frames as depth images loaded
+    if debug:
+        max_frames = len(depth_imgs)  # Should be 10 or less
+        state_joint = state_joint[:max_frames]
+        state_effector = state_effector[:max_frames]
+        state_head = state_head[:max_frames]
+        state_waist = state_waist[:max_frames]
+        action_joint = action_joint[:max_frames]
+        action_effector = action_effector[:max_frames]
+        action_head = action_head[:max_frames]
+        action_waist = action_waist[:max_frames]
+        action_velocity = action_velocity[:max_frames]
 
     states_value = np.hstack(
         [state_joint, state_effector, state_head, state_waist]
@@ -584,7 +641,8 @@ def main(
     )
 
     if debug:
-        all_subdir = all_subdir[:2]
+        all_subdir = all_subdir[:1]  # Just process 1 episode
+        chunk_size = 1  # Process one at a time in debug mode
 
     # Get all episode id
     all_subdir_eids = [int(Path(path).name) for path in all_subdir]
@@ -599,12 +657,12 @@ def main(
         # Process only this chunk
         if debug:
             raw_datasets_chunk = [
-                load_local_dataset(subdir, src_path=src_path, task_id=task_id)
+                load_local_dataset(subdir, src_path=src_path, task_id=task_id, debug=debug)
                 for subdir in tqdm(chunk_eids, desc="Loading chunk data")
             ]
         else:
             raw_datasets_chunk = process_map(
-                partial(load_local_dataset, src_path=src_path, task_id=task_id),
+                partial(load_local_dataset, src_path=src_path, task_id=task_id, debug=debug),
                 chunk_eids,
                 max_workers=os.cpu_count() // 2,
                 desc=f"Loading chunk {chunk_start//chunk_size + 1}/{(len(all_subdir_eids) + chunk_size - 1)//chunk_size}",
@@ -618,8 +676,8 @@ def main(
             for raw_dataset_sub in tqdm(
                 raw_dataset[0], desc="Processing frames", leave=False
             ):
-                dataset.add_frame(raw_dataset_sub)
-            dataset.save_episode(task=episode_desc, videos=raw_dataset[1])
+                dataset.add_frame(raw_dataset_sub, task=episode_desc)
+            dataset.save_episode(videos=raw_dataset[1])
             
         # Clear memory after each chunk
         raw_datasets_chunk = None
