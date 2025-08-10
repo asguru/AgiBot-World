@@ -410,45 +410,14 @@ class AgiBotDataset(LeRobotDataset):
                     shutil.copyfile(videos[key], video_path)
 
         # Compute episode statistics (custom implementation for numpy arrays)
-        from lerobot.datasets.compute_stats import get_feature_stats, sample_indices
-        from lerobot.datasets.video_utils import decode_video_frames
+        from lerobot.datasets.compute_stats import get_feature_stats
         
         ep_stats = {}
         for key, data in episode_buffer.items():
             if self.features[key]["dtype"] == "string":
                 continue  # Skip string features
-            elif self.features[key]["dtype"] == "video":
-                # Handle video features by sampling frames from video files
-                if key in videos and videos[key].exists():
-                    try:
-                        # Get video file path
-                        video_path = videos[key]
-                        
-                        # Sample frame timestamps (similar to what convert_stats does)
-                        num_frames = episode_length
-                        sampled_indices = sample_indices(num_frames)
-                        timestamps = [i / self.fps for i in sampled_indices]  # Use dataset fps
-                        
-                        # Decode video frames
-                        video_frames = decode_video_frames(video_path, timestamps, tolerance_s=0.5)
-                        ep_ft_array = video_frames.numpy()  # Shape: [sampled_frames, c, h, w]
-                        
-                        # Compute stats (frames are already in channel-first format from decode_video_frames)
-                        axes_to_reduce = (0, 2, 3)  # keep channel dim
-                        keepdims = True
-                        ep_stats[key] = get_feature_stats(ep_ft_array, axis=axes_to_reduce, keepdims=keepdims)
-                        # Normalize by 255 and remove batch dim like LeRobot does for all images
-                        ep_stats[key] = {
-                            k: v if k == "count" else np.squeeze(v, axis=0) 
-                            for k, v in ep_stats[key].items()
-                        }
-                        logging.info(f"Computed video stats for {key} using {len(sampled_indices)} sampled frames")
-                    except Exception as e:
-                        logging.warning(f"Failed to compute video stats for {key}: {e}")
-                        # Skip this video feature if stats computation fails
-                        continue
-            elif self.features[key]["dtype"] == "image":
-                # Handle image features that are numpy arrays
+            elif self.features[key]["dtype"] in ["image", "video"]:
+                # Handle image/video features that are numpy arrays
                 if isinstance(data, list) and len(data) > 0:
                     # Stack the image arrays and compute stats
                     ep_ft_array = np.stack(data)  # Shape: [num_frames, height, width, channels]
